@@ -18,7 +18,6 @@ def value_iteration(env, gamma=0.9, tol=1e-6):
     while True:
         delta = 0
         for s in range(nS):
-            # compute expected returns for all actions using base env.P
             action_values = [
                 sum(p * (r + gamma * V[s_next]) for p, s_next, r, _ in env.P[s][a])
                 for a in range(nA)
@@ -39,42 +38,59 @@ def value_iteration(env, gamma=0.9, tol=1e-6):
         policy[s] = int(np.argmax(q_sa))
     return V, policy, iteration
 
-# Unified run interface
-
-def run(episodes, algorithm='q_learning', render=False, slippery=False, seed=22):
+# Unified run interface with is_training flag
+def run(
+    episodes,
+    algorithm='q_learning',
+    is_training=True,
+    render=False,
+    slippery=False,
+    seed=22
+):
     """
-    Unified interface for Q-Learning or Value Iteration on FrozenLake-v1.
-
-    episodes: number of episodes to train (Q-learning) or to evaluate (VI).
-    algorithm: 'q_learning' or 'value_iteration'.
-    render: whether to render environment during evaluation.
-    slippery: environment slipperiness.
-    seed: random seed for reproducibility.
+    episodes: 
+      - for Q-Learning: number of training episodes (if is_training=True) 
+                       or evaluation episodes (if is_training=False)
+      - for VI:        number of evaluation episodes (if is_training=False); 
+                       ignored if is_training=True
+    algorithm: 'q_learning' or 'value_iteration'
+    is_training: whether to train (True) or load+evaluate (False)
+    render:      render during evaluation
+    slippery:    whether the lake is slippery
+    seed:        RNG seed
     """
-    # Create environment
+    # --- setup ---
     env = gym.make(
-        'FrozenLake-v1', map_name="4x4", is_slippery=slippery,
-        render_mode="human" if render else None
+        'FrozenLake-v1',
+        map_name="4x4",
+        is_slippery=slippery,
+        render_mode="human" if render and not is_training else None
     )
-    # Unwrap to access transition model
     base_env = env.unwrapped
-
-    # Set seeds
     env.reset(seed=seed)
     env.action_space.seed(seed)
     env.observation_space.seed(seed)
     rng = np.random.default_rng(seed)
 
-    # File names based on algorithm and slipperiness
     prefix = 'slippery' if slippery else 'non_slippery'
+    q_file = f"q_{prefix}.pkl"
+    vi_file = f"V_{prefix}.pkl"
 
-    # Initialize structures
+    # --- initialize or load models ---
     if algorithm == 'q_learning':
-        q = np.zeros((env.observation_space.n, env.action_space.n))
-    else:
-        V, policy, iters = value_iteration(base_env)
+        if is_training:
+            q = np.zeros((env.observation_space.n, env.action_space.n))
+        else:
+            with open(q_file, 'rb') as f:
+                q = pickle.load(f)
+    else:  # value_iteration
+        if is_training:
+            V, policy, iters = value_iteration(base_env)
+        else:
+            with open(vi_file, 'rb') as f:
+                V, policy = pickle.load(f)
 
-    # Q-learning hyperparameters
+    # Q-learning hyperparams
     alpha = 0.9
     gamma = 0.9
     epsilon = 1.0
@@ -82,55 +98,70 @@ def run(episodes, algorithm='q_learning', render=False, slippery=False, seed=22)
 
     rewards_per_episode = np.zeros(episodes)
 
-    # Training or evaluation loop
+    # --- train or evaluate ---
     if algorithm == 'q_learning':
-        for i in range(episodes):
-            state, _ = env.reset()
-            done = False
-            while not done:
-                # epsilon-greedy action selection
-                if rng.random() < epsilon:
-                    action = env.action_space.sample()
-                else:
+        if is_training:
+            for i in range(episodes):
+                state, _ = env.reset()
+                done = False
+                while not done:
+                    if rng.random() < epsilon:
+                        action = env.action_space.sample()
+                    else:
+                        action = int(np.argmax(q[state]))
+                    new_state, reward, terminated, truncated, _ = env.step(action)
+                    done = terminated or truncated
+                    q[state, action] += alpha * (
+                        reward + gamma * np.max(q[new_state]) - q[state, action]
+                    )
+                    state = new_state
+                epsilon = max(epsilon - epsilon_decay, 0)
+                if reward == 1:
+                    rewards_per_episode[i] = 1
+
+            # save and report convergence
+            with open(q_file, 'wb') as f:
+                pickle.dump(q, f)
+            conv_ep = check_convergence(rewards_per_episode)
+            print(f"Q-Learning converged at episode {conv_ep}")
+        else:
+            # evaluation
+            for i in range(episodes):
+                state, _ = env.reset()
+                done = False
+                while not done:
                     action = int(np.argmax(q[state]))
-                new_state, reward, terminated, truncated, _ = env.step(action)
-                done = terminated or truncated
-                # Q-update
-                q[state, action] += alpha * (
-                    reward + gamma * np.max(q[new_state]) - q[state, action]
-                )
-                state = new_state
-            epsilon = max(epsilon - epsilon_decay, 0)
-            if reward == 1:
-                rewards_per_episode[i] = 1
-        # Save Q-table
-        with open(f"q_{prefix}.pkl", "wb") as f:
-            pickle.dump(q, f)
-        # Convergence
-        conv_ep = check_convergence(rewards_per_episode)
-        print(f"Q-Learning converged at episode {conv_ep}")
-    else:
-        # Evaluate VI policy using original env for stepping
-        success = 0
-        for i in range(episodes):
-            state, _ = env.reset()
-            done = False
-            while not done:
-                action = int(policy[state])
-                state, reward, terminated, truncated, _ = env.step(action)
-                done = terminated or truncated
-            if reward == 1:
-                rewards_per_episode[i] = 1
-                success += 1
-        print(f"Value Iteration converged in {iters} iterations")
-        print(f"VI policy success rate: {success/episodes*100:.2f}%")
-        # Save policy and values
-        with open(f"V_{prefix}.pkl", "wb") as f:
-            pickle.dump((V, policy), f)
+                    state, reward, terminated, truncated, _ = env.step(action)
+                    done = terminated or truncated
+                if reward == 1:
+                    rewards_per_episode[i] = 1
+            print(f"Q-Learning success rate: {rewards_per_episode.mean()*100:.2f}%")
+    else:  # value_iteration
+        if is_training:
+            # save VI results
+            with open(vi_file, 'wb') as f:
+                pickle.dump((V, policy), f)
+            print(f"Value Iteration converged in {iters} iterations")
+            env.close()
+            return
+        else:
+            # evaluation
+            success = 0
+            for i in range(episodes):
+                state, _ = env.reset()
+                done = False
+                while not done:
+                    action = int(policy[state])
+                    state, reward, terminated, truncated, _ = env.step(action)
+                    done = terminated or truncated
+                if reward == 1:
+                    rewards_per_episode[i] = 1
+                    success += 1
+            print(f"VI policy success rate: {success/episodes*100:.2f}%")
 
     env.close()
 
-    # Cumulative success plot
+    # --- plotting ---
     cum_success = np.cumsum(rewards_per_episode)
     plt.figure()
     plt.plot(cum_success)
@@ -140,14 +171,14 @@ def run(episodes, algorithm='q_learning', render=False, slippery=False, seed=22)
     plt.savefig(f"cum_success_{algorithm}_{prefix}.png")
     plt.show()
 
-    # For VI, also plot heatmap of state values
-    if algorithm == 'value_iteration':
+    # optional VI heatmap if you evaluated VI
+    if algorithm == 'value_iteration' and not is_training:
         plt.figure()
-        grid_shape = int(np.sqrt(len(V)))
-        V_grid = V.reshape((grid_shape, grid_shape))
+        grid = int(np.sqrt(len(V)))
+        V_grid = V.reshape((grid, grid))
         plt.imshow(V_grid, interpolation='nearest')
-        for i in range(grid_shape):  # annotate values
-            for j in range(grid_shape):
+        for i in range(grid):
+            for j in range(grid):
                 plt.text(j, i, f"{V_grid[i, j]:.2f}", ha='center', va='center')
         plt.title('State-Value Heatmap (V)')
         plt.colorbar()
@@ -156,12 +187,12 @@ def run(episodes, algorithm='q_learning', render=False, slippery=False, seed=22)
 
 
 if __name__ == "__main__":
-    # Example usages:
-    # Q-Learning training:
-    # run(15000, algorithm='q_learning', render=False, slippery=False)
-    # Q-Learning evaluation:
-    # run(1000, algorithm='q_learning', render=False, slippery=False)
+    # Q-Learning train
+    # run(15000, algorithm='q_learning', is_training=True, slippery=False)
+    # Q-Learning eval
+    run(1,  algorithm='q_learning', is_training=False, slippery=False, render=True)
 
-    # Value Iteration evaluation:
-    # run(10000, algorithm='value_iteration', render=False, slippery=False)
-    run(30000, algorithm='value_iteration', render=False, slippery=True)
+    # VI train (just compute & save)
+    # run(None,  algorithm='value_iteration', is_training=True, slippery=True)
+    # VI eval
+    run(1,  algorithm='value_iteration', is_training=False, slippery=True, render=True)
